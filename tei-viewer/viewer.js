@@ -12,6 +12,7 @@
   const fileList = document.getElementById('fileList');
   const indexCount = document.getElementById('indexCount');
   const filterInput = document.getElementById('filterInput');
+  const statusLine = document.getElementById('statusLine');
 
   let hideZh = false;
   let hideEn = false;
@@ -21,6 +22,10 @@
 
   function normalizeSpace(text) {
     return (text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function setStatus(text) {
+    statusLine.textContent = text;
   }
 
   function localName(node) {
@@ -133,21 +138,32 @@
     return 'Untitled TEI';
   }
 
-  function renderSegments() {
+  async function renderSegments() {
     content.innerHTML = '';
     document.body.classList.toggle('hidden-zh', hideZh);
     document.body.classList.toggle('hidden-en', hideEn);
 
-    for (const seg of currentSegments) {
-      const node = template.content.cloneNode(true);
-      node.querySelector('.seg-id').textContent = seg.id;
-      node.querySelector('.zh-text').textContent = seg.zh || '(empty)';
-      node.querySelector('.en-text').textContent = seg.en || '(no translation note found)';
-      content.appendChild(node);
+    const batchSize = 80;
+    for (let i = 0; i < currentSegments.length; i += batchSize) {
+      const frag = document.createDocumentFragment();
+      const end = Math.min(currentSegments.length, i + batchSize);
+      for (let j = i; j < end; j += 1) {
+        const seg = currentSegments[j];
+        const node = template.content.cloneNode(true);
+        node.querySelector('.seg-id').textContent = seg.id;
+        node.querySelector('.zh-text').textContent = seg.zh || '(empty)';
+        node.querySelector('.en-text').textContent = seg.en || '(no translation note found)';
+        frag.appendChild(node);
+      }
+      content.appendChild(frag);
+      setStatus(`Rendering segments ${end}/${currentSegments.length} ...`);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
     }
+    setStatus(`Loaded ${currentSegments.length} segments.`);
   }
 
-  function parseXml(xmlText, fileLabel) {
+  async function parseXml(xmlText, fileLabel) {
+    setStatus('Parsing XML ...');
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'application/xml');
     const err = doc.querySelector('parsererror');
@@ -164,12 +180,13 @@
     metaTitle.textContent = findTitle(doc);
     metaFile.textContent = fileLabel || '-';
     metaCount.textContent = String(currentSegments.length);
-    renderSegments();
+    await renderSegments();
   }
 
   async function openFile(file, fileKey) {
+    setStatus(`Reading ${fileKey || file.name} ...`);
     const text = await file.text();
-    parseXml(text, fileKey || file.name);
+    await parseXml(text, fileKey || file.name);
     activeFileKey = fileKey || file.name;
     refreshFileList();
   }
@@ -197,6 +214,7 @@
   }
 
   function indexFolderFiles(fileListObj) {
+    setStatus('Indexing folder ...');
     const arr = Array.from(fileListObj || [])
       .filter((f) => /\.xml$/i.test(f.name))
       .map((f) => ({
@@ -209,6 +227,17 @@
     activeFileKey = '';
     refreshFileList();
 
+    if (indexedFiles.length === 0) {
+      setStatus('No .xml files found in selected folder.');
+      currentSegments = [];
+      metaTitle.textContent = '-';
+      metaFile.textContent = '-';
+      metaCount.textContent = '0';
+      content.innerHTML = '';
+      return;
+    }
+
+    setStatus(`Indexed ${indexedFiles.length} XML files. Loading first file ...`);
     if (indexedFiles.length > 0) {
       openFile(indexedFiles[0].file, indexedFiles[0].key).catch((err) => alert(String(err)));
     }
@@ -221,7 +250,9 @@
       indexedFiles = [{ file, key: file.name }];
       await openFile(file, file.name);
       refreshFileList();
+      setStatus(`Loaded file ${file.name}.`);
     } catch (err) {
+      setStatus(`Error: ${String(err)}`);
       alert(String(err));
     }
   });
@@ -230,6 +261,7 @@
     try {
       indexFolderFiles(e.target.files);
     } catch (err) {
+      setStatus(`Error: ${String(err)}`);
       alert(String(err));
     }
   });
@@ -263,7 +295,9 @@
       indexedFiles = [{ file, key: file.name }];
       await openFile(file, file.name);
       refreshFileList();
+      setStatus(`Loaded file ${file.name}.`);
     } catch (err) {
+      setStatus(`Error: ${String(err)}`);
       alert(String(err));
     }
   });
@@ -273,12 +307,16 @@
   toggleZh.addEventListener('click', () => {
     hideZh = !hideZh;
     toggleZh.textContent = hideZh ? 'Show Original' : 'Hide Original';
-    renderSegments();
+    renderSegments().catch((err) => {
+      setStatus(`Error: ${String(err)}`);
+    });
   });
 
   toggleEn.addEventListener('click', () => {
     hideEn = !hideEn;
     toggleEn.textContent = hideEn ? 'Show Translation' : 'Hide Translation';
-    renderSegments();
+    renderSegments().catch((err) => {
+      setStatus(`Error: ${String(err)}`);
+    });
   });
 })();

@@ -67,6 +67,12 @@ button:hover,
   color: var(--muted);
 }
 
+.status {
+  margin: 0 16px 12px;
+  color: #35506a;
+  font-size: 13px;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: 320px 1fr;
