@@ -86,6 +86,14 @@ cmake --build build-cuda -j10
 - `--no-resume`: disable resume skipping
 - `--overwrite-existing-translations`: replace existing translation notes
 
+Single-file mode:
+- If `--input` is one XML file, `--output` may be either:
+  - a directory, or
+  - a specific output XML file path (e.g. `/tmp/out.xml`).
+
+Model auto-download:
+- If `--model` path does not exist, `tei_mt` auto-downloads HY-MT Q8_0 GGUF from official Hugging Face URL using `curl` and shows transfer progress in the terminal.
+
 ## Performance Notes
 
 - On RTX 4060M class hardware, best throughput is typically with low worker count (`1-2`) and moderate threads (`4-8`).

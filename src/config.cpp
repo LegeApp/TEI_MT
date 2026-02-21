@@ -31,7 +31,7 @@ bool parse_size_arg(const std::string& key, const std::string& value, std::size_
 void print_usage(const char* program_name) {
     std::cout
         << "Usage:\n"
-        << "  " << program_name << " --input <tei-file-or-dir> --output <out-dir> --model <gguf-path> [options]\n\n"
+        << "  " << program_name << " --input <tei-file-or-dir> --output <out-dir-or-file.xml> --model <gguf-path> [options]\n\n"
         << "Options:\n"
         << "  --workers <n>         Worker threads (default: hardware concurrency)\n"
         << "  --max-tokens <n>      Max generated tokens per segment (default: 192)\n"

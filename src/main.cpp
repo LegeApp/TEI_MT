@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -20,6 +22,24 @@
 #include <pugixml.hpp>
 
 namespace {
+
+constexpr const char* kDefaultModelUrl =
+    "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q8_0.gguf?download=true";
+
+std::string shell_single_quote(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    out.push_back('\'');
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
 
 bool has_xml_extension(const std::filesystem::path& path) {
     std::string ext = path.extension().string();
@@ -80,6 +100,67 @@ bool collect_input_files(
         return false;
     }
 
+    return true;
+}
+
+bool output_path_looks_like_xml_file(const std::filesystem::path& p) {
+    if (p.empty()) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec)) {
+        return std::filesystem::is_regular_file(p, ec);
+    }
+    return has_xml_extension(p);
+}
+
+bool ensure_model_available(std::string& model_path, std::string& error) {
+    std::filesystem::path model(model_path);
+    std::error_code ec;
+    if (std::filesystem::exists(model, ec) && std::filesystem::is_regular_file(model, ec)) {
+        return true;
+    }
+
+    // If only a filename is provided, resolve to current runtime directory.
+    if (!model.has_parent_path()) {
+        model = std::filesystem::current_path() / model;
+    }
+
+    const auto parent = model.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            error = "Failed to create model directory: " + parent.string();
+            return false;
+        }
+    }
+
+    const auto partial = model.string() + ".part";
+
+    std::cerr
+        << "[model] missing model file at: " << model.string() << "\n"
+        << "[model] downloading from: " << kDefaultModelUrl << "\n";
+
+    const std::string cmd =
+        "curl -L --fail --progress-bar -o " + shell_single_quote(partial) +
+        " " + shell_single_quote(kDefaultModelUrl);
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+        std::filesystem::remove(partial, ec);
+        error = "Model download failed (curl exit code " + std::to_string(rc) + ")";
+        return false;
+    }
+
+    std::filesystem::rename(partial, model, ec);
+    if (ec) {
+        std::filesystem::remove(partial, ec);
+        error = "Failed to finalize downloaded model at: " + model.string();
+        return false;
+    }
+
+    model_path = model.string();
+    std::cerr << "[model] download complete: " << model_path << "\n";
     return true;
 }
 
@@ -248,7 +329,26 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::filesystem::create_directories(config.output_dir);
+    const bool input_is_dir = std::filesystem::is_directory(config.input_path);
+    const bool output_is_single_xml_file = !input_is_dir && output_path_looks_like_xml_file(config.output_dir);
+    if (input_is_dir && output_is_single_xml_file) {
+        std::cerr << "For directory input, --output must be a directory path.\n";
+        return 1;
+    }
+
+    if (output_is_single_xml_file) {
+        const auto parent = config.output_dir.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+    } else {
+        std::filesystem::create_directories(config.output_dir);
+    }
+
+    if (!ensure_model_available(config.model_path, error)) {
+        std::cerr << "[fatal] " << error << "\n";
+        return 1;
+    }
 
     LlamaTranslatorConfig translator_cfg;
     translator_cfg.model_path = config.model_path;
@@ -264,8 +364,6 @@ int main(int argc, char** argv) {
         std::cerr << "[fatal] failed to initialize translator: " << ex.what() << "\n";
         return 1;
     }
-
-    const bool input_is_dir = std::filesystem::is_directory(config.input_path);
 
     std::size_t total_segments = 0;
     std::chrono::milliseconds total_time{0};
@@ -285,9 +383,18 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        const auto rel_path = output_relative_for(config.input_path, input_is_dir, xml_file);
-        const auto out_parent = config.output_dir / rel_path.parent_path();
-        const auto tei_path = config.output_dir / rel_path;
+        std::filesystem::path rel_path;
+        std::filesystem::path out_parent;
+        std::filesystem::path tei_path;
+        if (output_is_single_xml_file) {
+            tei_path = config.output_dir;
+            out_parent = tei_path.parent_path();
+            rel_path = tei_path.filename();
+        } else {
+            rel_path = output_relative_for(config.input_path, input_is_dir, xml_file);
+            out_parent = config.output_dir / rel_path.parent_path();
+            tei_path = config.output_dir / rel_path;
+        }
 
         std::string resume_reason;
         if (should_resume_skip_file(
@@ -345,9 +452,15 @@ int main(int argc, char** argv) {
         std::filesystem::create_directories(out_parent);
 
         if (config.emit_markdown) {
-            auto md_name = rel_path.filename();
-            md_name.replace_extension(".en.md");
-            const auto md_path = out_parent / md_name;
+            std::filesystem::path md_path;
+            if (output_is_single_xml_file) {
+                md_path = tei_path;
+                md_path.replace_extension(".en.md");
+            } else {
+                auto md_name = rel_path.filename();
+                md_name.replace_extension(".en.md");
+                md_path = out_parent / md_name;
+            }
             if (!write_markdown_output(md_path, doc, translations, error)) {
                 std::cerr << "[error] markdown write failed for " << xml_file << ": " << error << "\n";
                 ++files_failed;
