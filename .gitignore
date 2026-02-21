@@ -1,0 +1,43 @@
+# Build outputs
+/build/
+/build-*/
+/cmake-build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# CMake/generated
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+cmake_install.cmake
+Makefile
+
+# Runtime/output artifacts
+/out-*/
+*.log
+
+# Local models and large artifacts
+*.gguf
+*.onnx
+*.onnx_data*
+*.zip
+
+# Python/env/editor
+.venv/
+venv/
+__pycache__/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local dependency clones / experiments
+/LCUI/
+/llama.cpp/
+/tmp-*/
+

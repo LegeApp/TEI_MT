@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<lcui-app>
+  <resource type="text/css" src="ui_style.css"/>
+  <ui>
+    <text id="title">HY-MT Translator (LCUI)</text>
+
+    <text class="label">tei_mt binary</text>
+    <textinput id="tei_mt_path">../build-cuda-patched/tei_mt</textinput>
+
+    <text class="label">Input (file or directory)</text>
+    <textinput id="input_path">/mnt/Samsung980_1TB/Rust-projects/MT15-model/tester</textinput>
+
+    <text class="label">Output directory</text>
+    <textinput id="output_path">/mnt/Samsung980_1TB/Rust-projects/MT15-model/hy-mt-cpp/build-cuda-patched/out-gui</textinput>
+
+    <text class="label">Model (GGUF)</text>
+    <textinput id="model_path">/mnt/Samsung980_1TB/Rust-projects/MT15-model/hy-mt-cpp/HY-MT1.5-1.8B-Q8_0.gguf</textinput>
+
+    <text class="label">workers threads ctx max_tokens n_gpu_layers</text>
+    <div class="row">
+      <textinput id="workers">2</textinput>
+      <textinput id="threads">8</textinput>
+      <textinput id="ctx">2048</textinput>
+      <textinput id="max_tokens">192</textinput>
+      <textinput id="n_gpu_layers">-1</textinput>
+    </div>
+
+    <text class="label">emit_markdown no_resume overwrite_existing no_progress (0/1)</text>
+    <div class="row">
+      <textinput id="emit_markdown">0</textinput>
+      <textinput id="no_resume">0</textinput>
+      <textinput id="overwrite_existing">0</textinput>
+      <textinput id="no_progress">1</textinput>
+    </div>
+
+    <div class="row buttons">
+      <button id="btn_start">Start</button>
+      <button id="btn_pause">Pause</button>
+      <button id="btn_resume">Resume</button>
+      <button id="btn_cancel">Cancel</button>
+    </div>
+
+    <text id="status_line">Idle</text>
+    <text id="file_counter">Files: 0/0 (remaining 0)</text>
+
+    <div id="progress_outer">
+      <div id="progress_fill" />
+    </div>
+    <text id="progress_text">0%</text>
+
+    <text class="label">Logs</text>
+    <scrollarea id="log_area">
+      <text id="log_text"></text>
+    </scrollarea>
+  </ui>
+</lcui-app>

@@ -1,0 +1,70 @@
+* {
+  box-sizing: border-box;
+  font-family: "Noto Sans", "Segoe UI", sans-serif;
+}
+
+#title {
+  font-size: 22px;
+  margin: 12px 12px 8px 12px;
+  color: #0e2a47;
+}
+
+.label {
+  margin: 8px 12px 4px 12px;
+  color: #2f3b46;
+}
+
+textinput {
+  margin: 0 12px 8px 12px;
+  padding: 8px;
+  border: 1px solid #cfd8dc;
+  border-radius: 4px;
+  background-color: #fdfefe;
+}
+
+.row {
+  display: flex;
+  margin: 0 12px 8px 12px;
+}
+
+.row textinput {
+  width: 20%;
+  margin: 0 8px 0 0;
+}
+
+.row.buttons button {
+  margin: 0 8px 0 0;
+  padding: 8px 12px;
+}
+
+#status_line,
+#file_counter,
+#progress_text {
+  margin: 4px 12px;
+}
+
+#progress_outer {
+  margin: 4px 12px;
+  height: 14px;
+  border: 1px solid #90a4ae;
+  border-radius: 4px;
+  background-color: #eceff1;
+}
+
+#progress_fill {
+  width: 0%;
+  height: 100%;
+  background-color: #4caf50;
+}
+
+#log_area {
+  margin: 6px 12px 12px 12px;
+  height: 220px;
+  border: 1px solid #cfd8dc;
+  border-radius: 4px;
+}
+
+#log_text {
+  white-space: pre-wrap;
+  margin: 8px;
+}
