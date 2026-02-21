@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TEI Viewer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>TEI Translation Viewer</h1>
+    <div class="controls">
+      <label class="file-btn">
+        Open XML
+        <input id="fileInput" type="file" accept=".xml,text/xml,application/xml" />
+      </label>
+      <label class="file-btn">
+        Open Folder
+        <input id="folderInput" type="file" webkitdirectory directory multiple />
+      </label>
+      <button id="toggleZh">Hide Original</button>
+      <button id="toggleEn">Hide Translation</button>
+    </div>
+  </header>
+
+  <section class="meta" id="meta">
+    <div><strong>Title:</strong> <span id="metaTitle">-</span></div>
+    <div><strong>File:</strong> <span id="metaFile">-</span></div>
+    <div><strong>Segments:</strong> <span id="metaCount">0</span></div>
+  </section>
+
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>Folder Index</h2>
+        <span id="indexCount">0 files</span>
+      </div>
+      <input id="filterInput" class="filter" placeholder="Filter files..." />
+      <div id="fileList" class="file-list"></div>
+    </aside>
+
+    <section class="viewer-panel">
+      <section class="dropzone" id="dropzone">
+        Drop TEI XML file here, or click <strong>Open XML</strong> / <strong>Open Folder</strong>
+      </section>
+      <main id="content" class="content"></main>
+    </section>
+  </div>
+
+  <template id="segmentTemplate">
+    <article class="segment">
+      <div class="seg-id"></div>
+      <div class="seg-columns">
+        <section class="zh-col">
+          <h3>Original</h3>
+          <p class="zh-text"></p>
+        </section>
+        <section class="en-col">
+          <h3>Translation</h3>
+          <p class="en-text"></p>
+        </section>
+      </div>
+    </article>
+  </template>
+
+  <script src="viewer.js"></script>
+</body>
+</html>

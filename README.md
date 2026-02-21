@@ -102,6 +102,19 @@ An optional desktop wrapper exists in `lcui-gui/` for:
 
 See `lcui-gui/README.md`.
 
+## Lightweight TEI Viewer
+
+For human-readable viewing of translated TEI XML in-browser (instead of raw XML source), use:
+
+```bash
+cd tei-viewer
+./run_viewer.sh
+```
+
+Then open `http://127.0.0.1:8765/` and load any translated XML file.
+
+Viewer docs: `tei-viewer/README.md`.
+
 ## Status
 
 This repo is actively iterating toward full-volume CBETA translation workflows with reproducible batch runs and resumability.
