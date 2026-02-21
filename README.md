@@ -105,3 +105,9 @@ See `lcui-gui/README.md`.
 ## Status
 
 This repo is actively iterating toward full-volume CBETA translation workflows with reproducible batch runs and resumability.
+
+## Licensing
+
+- The HY-MT model family used by this project is governed by the **Tencent HY Community License Agreement**.
+- A copy of that license is included in `LICENSE` (sourced from the official HY-MT release).
+- Important: that license explicitly states territorial restrictions (it does not apply in the EU, UK, and South Korea).
