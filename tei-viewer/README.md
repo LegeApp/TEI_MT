@@ -12,12 +12,31 @@ Lightweight browser viewer for translated CBETA-style TEI XML.
 
 ## Use
 
+### Linux / macOS
+
 ```bash
 cd tei-viewer
 ./run_viewer.sh
 ```
 
-Open `http://127.0.0.1:8765/`.
+Optional port: `./run_viewer.sh 9000`
+
+### Windows
+
+From **File Explorer**: double-click `run_viewer.bat` (or open **PowerShell** in this folder and run `.\run_viewer.ps1`).
+
+From a terminal:
+
+```bat
+cd tei-viewer
+run_viewer.bat
+```
+
+Optional port: `run_viewer.bat 9000` or `.\run_viewer.ps1 9000`
+
+Requires **Python 3** on `PATH` (the installer from [python.org](https://www.python.org/downloads/) with *Add python.exe to PATH*, or the `py` launcher from that install).
+
+Open `http://127.0.0.1:8765/` in **Chrome** or **Edge** (recommended for **Open Folder**).
 
 Then:
 - Click `Open Folder` and select your translated XML directory.

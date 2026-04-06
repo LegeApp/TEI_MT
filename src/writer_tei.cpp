@@ -1,5 +1,7 @@
 #include "writer_tei.hpp"
 
+#include <filesystem>
+
 namespace {
 
 std::string local_name(const char* raw_name) {
@@ -91,8 +93,18 @@ bool write_tei_note_output(
         note.text().set(translations[i].c_str());
     }
 
-    if (!doc.xml.save_file(out_path.c_str(), "  ", pugi::format_default, pugi::encoding_utf8)) {
-        error = "Failed to write translated TEI XML: " + out_path.string();
+    const std::filesystem::path tmp_path = out_path.string() + ".part";
+    if (!doc.xml.save_file(tmp_path.string().c_str(), "  ", pugi::format_default, pugi::encoding_utf8)) {
+        error = "Failed to write translated TEI XML: " + tmp_path.string();
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(out_path, ec);
+    ec.clear();
+    std::filesystem::rename(tmp_path, out_path, ec);
+    if (ec) {
+        error = "Failed to finalize TEI output (rename): " + out_path.string() + " (" + ec.message() + ")";
         return false;
     }
 

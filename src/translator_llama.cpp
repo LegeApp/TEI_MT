@@ -1,10 +1,13 @@
 #include "translator_llama.hpp"
 
+#include "segment_batch.hpp"
+
 #include <llama.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -83,6 +86,18 @@ LlamaTranslator::LlamaTranslator(LlamaTranslatorConfig config)
         true,
         true
     );
+    prompt_prefix_multi_tokens_ = tokenize(
+        std::string(
+            "The following text has multiple Classical Chinese Buddhist passages. Each passage is separated by a line "
+            "containing exactly "
+        ) + k_coalesce_marker +
+            " (that marker alone on the line).\n"
+            "Translate each passage into natural English in the same order.\n"
+            "In your answer, put that exact marker alone on its own line between each English translation.\n"
+            "Output English only. Do not explain.\n\n",
+        true,
+        true
+    );
     prompt_suffix_tokens_ = tokenize("\n\nEnglish:\n", false, true);
 }
 
@@ -94,19 +109,58 @@ LlamaTranslator::LlamaTranslator(LlamaTranslatorConfig config, std::shared_ptr<S
         true,
         true
     );
+    prompt_prefix_multi_tokens_ = tokenize(
+        std::string(
+            "The following text has multiple Classical Chinese Buddhist passages. Each passage is separated by a line "
+            "containing exactly "
+        ) + k_coalesce_marker +
+            " (that marker alone on the line).\n"
+            "Translate each passage into natural English in the same order.\n"
+            "In your answer, put that exact marker alone on its own line between each English translation.\n"
+            "Output English only. Do not explain.\n\n",
+        true,
+        true
+    );
     prompt_suffix_tokens_ = tokenize("\n\nEnglish:\n", false, true);
 }
 
-LlamaTranslator::~LlamaTranslator() {
+void LlamaTranslator::release_context_resources() {
     if (sampler_ != nullptr) {
         llama_sampler_free(sampler_);
         sampler_ = nullptr;
     }
-
     if (ctx_ != nullptr) {
         llama_free(ctx_);
         ctx_ = nullptr;
     }
+}
+
+LlamaTranslator::~LlamaTranslator() {
+    release_context_resources();
+}
+
+bool LlamaTranslator::bump_ctx_capacity(const std::size_t prompt_tokens, const int generation_need) {
+    const int gen = std::max(1, generation_need);
+    const auto min_need = static_cast<long long>(prompt_tokens) + static_cast<long long>(gen) + 64LL;
+    int next = config_.n_ctx;
+    if (static_cast<long long>(next) < min_need) {
+        next = static_cast<int>(min_need);
+    }
+    next = std::max(next, config_.n_ctx * 2);
+    next = std::max(next, config_.n_ctx + 1024);
+    if (next > config_.max_n_ctx) {
+        next = config_.max_n_ctx;
+    }
+    if (next <= config_.n_ctx) {
+        return false;
+    }
+
+    std::cerr << "[ctx-grow] n_ctx " << config_.n_ctx << " -> " << next << " (prompt_tokens=" << prompt_tokens
+              << " gen_budget>=" << gen << ")\n";
+
+    release_context_resources();
+    config_.n_ctx = next;
+    return true;
 }
 
 std::shared_ptr<LlamaTranslator::SharedModel> LlamaTranslator::load_shared_model(const LlamaTranslatorConfig& config) {
@@ -118,10 +172,15 @@ void LlamaTranslator::ensure_context_ready() {
         return;
     }
 
+    const uint32_t n_ctx = static_cast<uint32_t>(std::max(512, config_.n_ctx));
+    const uint32_t n_batch = std::min<uint32_t>(512u, n_ctx);
+    const uint32_t n_ubatch = std::min<uint32_t>(256u, n_batch);
+    ctx_n_batch_ = n_batch;
+
     llama_context_params params = llama_context_default_params();
-    params.n_ctx = static_cast<uint32_t>(std::max(512, config_.n_ctx));
-    params.n_batch = params.n_ctx;
-    params.n_ubatch = params.n_ctx;
+    params.n_ctx = n_ctx;
+    params.n_batch = n_batch;
+    params.n_ubatch = n_ubatch;
     params.n_threads = std::max(1, config_.n_threads);
     params.n_threads_batch = std::max(1, config_.n_threads);
     params.offload_kqv = true;
@@ -181,6 +240,44 @@ std::vector<int32_t> LlamaTranslator::tokenize(const std::string& text, bool add
     return std::vector<int32_t>(tokens.begin(), tokens.end());
 }
 
+void LlamaTranslator::tokenize_into(
+    const std::string& text,
+    bool add_special,
+    bool parse_special,
+    std::vector<int32_t>& out
+) const {
+    const int32_t required = -llama_tokenize(
+        shared_model_->vocab,
+        text.c_str(),
+        static_cast<int32_t>(text.size()),
+        nullptr,
+        0,
+        add_special,
+        parse_special
+    );
+
+    if (required <= 0) {
+        throw std::runtime_error("llama_tokenize failed while querying required token count");
+    }
+
+    out.resize(static_cast<std::size_t>(required));
+    const int32_t written = llama_tokenize(
+        shared_model_->vocab,
+        text.c_str(),
+        static_cast<int32_t>(text.size()),
+        reinterpret_cast<llama_token*>(out.data()),
+        static_cast<int32_t>(out.size()),
+        add_special,
+        parse_special
+    );
+
+    if (written < 0) {
+        throw std::runtime_error("llama_tokenize failed while writing tokens");
+    }
+
+    out.resize(static_cast<std::size_t>(written));
+}
+
 std::string LlamaTranslator::token_to_piece(int32_t token) const {
     char local[256];
     const int first = llama_token_to_piece(
@@ -213,7 +310,7 @@ std::string LlamaTranslator::token_to_piece(int32_t token) const {
     return std::string(dynamic.data(), static_cast<std::size_t>(second));
 }
 
-std::string LlamaTranslator::postprocess_translation(std::string text) const {
+std::string LlamaTranslator::postprocess_translation(std::string text, bool coalesced_output) const {
     text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
 
     const std::string marker = "English:";
@@ -222,50 +319,126 @@ std::string LlamaTranslator::postprocess_translation(std::string text) const {
         text = text.substr(marker_pos + marker.size());
     }
 
-    const std::size_t dbl_newline = text.find("\n\n");
-    if (dbl_newline != std::string::npos) {
-        text = text.substr(0, dbl_newline);
+    if (!coalesced_output) {
+        const std::size_t dbl_newline = text.find("\n\n");
+        if (dbl_newline != std::string::npos) {
+            text = text.substr(0, dbl_newline);
+        }
     }
 
     return trim(std::move(text));
 }
+
+namespace {
+
+void decode_prompt_chunks(llama_context* ctx, int32_t* tok_i32, int32_t n_tokens, uint32_t chunk) {
+    for (int32_t pos = 0; pos < n_tokens; ) {
+        const int32_t n_take = static_cast<int32_t>(
+            std::min<uint32_t>(chunk, static_cast<uint32_t>(n_tokens - pos))
+        );
+        llama_batch batch = llama_batch_get_one(
+            reinterpret_cast<llama_token*>(tok_i32 + pos),
+            n_take
+        );
+        if (llama_decode(ctx, batch) != 0) {
+            throw std::runtime_error("llama_decode failed for prompt chunk");
+        }
+        pos += n_take;
+    }
+}
+
+void encode_prompt_chunks(llama_context* ctx, int32_t* tok_i32, int32_t n_tokens, uint32_t chunk) {
+    for (int32_t pos = 0; pos < n_tokens; ) {
+        const int32_t n_take = static_cast<int32_t>(
+            std::min<uint32_t>(chunk, static_cast<uint32_t>(n_tokens - pos))
+        );
+        llama_batch batch = llama_batch_get_one(
+            reinterpret_cast<llama_token*>(tok_i32 + pos),
+            n_take
+        );
+        if (llama_encode(ctx, batch) != 0) {
+            throw std::runtime_error("llama_encode failed for prompt chunk");
+        }
+        pos += n_take;
+    }
+}
+
+}  // namespace
 
 bool LlamaTranslator::has_early_stop_marker(const std::string& generated) const {
     return generated.find("\n\n") != std::string::npos;
 }
 
 std::string LlamaTranslator::translate(const Segment& segment) {
-    ensure_context_ready();
+    const std::vector<int32_t>& prefix_tokens =
+        segment.coalesced_batch ? prompt_prefix_multi_tokens_ : prompt_prefix_tokens_;
 
-    llama_memory_clear(llama_get_memory(ctx_), true);
-    llama_sampler_reset(sampler_);
+    for (int grow_attempt = 0; grow_attempt < 48; ++grow_attempt) {
+        ensure_context_ready();
 
-    const std::vector<int32_t> segment_tokens_i32 = tokenize(segment.source_zh, false, true);
-    std::vector<int32_t> prompt_tokens_i32;
-    prompt_tokens_i32.reserve(prompt_prefix_tokens_.size() + segment_tokens_i32.size() + prompt_suffix_tokens_.size());
-    prompt_tokens_i32.insert(prompt_tokens_i32.end(), prompt_prefix_tokens_.begin(), prompt_prefix_tokens_.end());
-    prompt_tokens_i32.insert(prompt_tokens_i32.end(), segment_tokens_i32.begin(), segment_tokens_i32.end());
-    prompt_tokens_i32.insert(prompt_tokens_i32.end(), prompt_suffix_tokens_.begin(), prompt_suffix_tokens_.end());
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        llama_sampler_reset(sampler_);
 
-    if (prompt_tokens_i32.empty()) {
-        throw std::runtime_error("Prompt tokenization produced no tokens");
-    }
+        const int base_gen =
+            segment.max_output_tokens > 0 ? segment.max_output_tokens : std::max(1, config_.max_tokens);
 
-    std::vector<llama_token> prompt_tokens(prompt_tokens_i32.begin(), prompt_tokens_i32.end());
+        tokenize_into(segment.source_zh, false, true, segment_tokens_scratch_);
 
-    const uint32_t n_ctx_actual = llama_n_ctx(ctx_);
-    if (prompt_tokens.size() + static_cast<std::size_t>(std::max(1, config_.max_tokens)) >= n_ctx_actual) {
-        throw std::runtime_error(
-            "Prompt too long for context window (prompt_tokens=" + std::to_string(prompt_tokens.size()) +
-            ", n_ctx=" + std::to_string(n_ctx_actual) + ")"
+        prompt_i32_scratch_.clear();
+        prompt_i32_scratch_.reserve(
+            prefix_tokens.size() + segment_tokens_scratch_.size() + prompt_suffix_tokens_.size()
         );
-    }
+        prompt_i32_scratch_.insert(prompt_i32_scratch_.end(), prefix_tokens.begin(), prefix_tokens.end());
+        prompt_i32_scratch_.insert(prompt_i32_scratch_.end(), segment_tokens_scratch_.begin(), segment_tokens_scratch_.end());
+        prompt_i32_scratch_.insert(prompt_i32_scratch_.end(), prompt_suffix_tokens_.begin(), prompt_suffix_tokens_.end());
 
-    if (llama_model_has_encoder(shared_model_->model)) {
-        llama_batch enc_batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
-        if (llama_encode(ctx_, enc_batch) != 0) {
-            throw std::runtime_error("llama_encode failed");
+        if (prompt_i32_scratch_.empty()) {
+            throw std::runtime_error("Prompt tokenization produced no tokens");
         }
+
+        const uint32_t n_ctx_actual_u = llama_n_ctx(ctx_);
+        const int n_ctx_actual = static_cast<int>(n_ctx_actual_u);
+        const int prompt_n = static_cast<int>(prompt_i32_scratch_.size());
+
+        if (prompt_n + base_gen >= n_ctx_actual) {
+            if (!bump_ctx_capacity(prompt_i32_scratch_.size(), base_gen)) {
+                throw std::runtime_error(
+                    "Prompt too long for context window (prompt_tokens=" + std::to_string(prompt_i32_scratch_.size()) +
+                    ", n_ctx=" + std::to_string(n_ctx_actual) + ", max_n_ctx=" + std::to_string(config_.max_n_ctx) + ")"
+                );
+            }
+            continue;
+        }
+
+        const int space = n_ctx_actual - prompt_n - 1;
+        if (space < 1) {
+            if (!bump_ctx_capacity(prompt_i32_scratch_.size(), base_gen)) {
+                throw std::runtime_error(
+                    "Prompt too long for context window (prompt_tokens=" + std::to_string(prompt_i32_scratch_.size()) +
+                    ", n_ctx=" + std::to_string(n_ctx_actual) + ", max_n_ctx=" + std::to_string(config_.max_n_ctx) + ")"
+                );
+            }
+            continue;
+        }
+
+        const int scaled_floor = std::max(base_gen, std::min(n_ctx_actual, prompt_n / 3));
+        int gen_cap = std::min(scaled_floor, space);
+        gen_cap = std::max(gen_cap, std::min(base_gen, space));
+
+        if (prompt_n + gen_cap >= n_ctx_actual) {
+            if (!bump_ctx_capacity(prompt_i32_scratch_.size(), gen_cap)) {
+                throw std::runtime_error(
+                    "Prompt too long for context window (prompt_tokens=" + std::to_string(prompt_i32_scratch_.size()) +
+                    ", n_ctx=" + std::to_string(n_ctx_actual) + ", max_n_ctx=" + std::to_string(config_.max_n_ctx) + ")"
+                );
+            }
+            continue;
+        }
+
+        const int32_t prompt_len = static_cast<int32_t>(prompt_i32_scratch_.size());
+
+        if (llama_model_has_encoder(shared_model_->model)) {
+        encode_prompt_chunks(ctx_, prompt_i32_scratch_.data(), prompt_len, ctx_n_batch_);
 
         llama_token decoder_start = llama_model_decoder_start_token(shared_model_->model);
         if (decoder_start == LLAMA_TOKEN_NULL) {
@@ -275,7 +448,7 @@ std::string LlamaTranslator::translate(const Segment& segment) {
         llama_batch dec_batch = llama_batch_get_one(&decoder_start, 1);
         std::string generated;
 
-        for (int i = 0; i < std::max(1, config_.max_tokens); ++i) {
+        for (int i = 0; i < gen_cap; ++i) {
             if (llama_decode(ctx_, dec_batch) != 0) {
                 throw std::runtime_error("llama_decode failed during encoder-decoder generation");
             }
@@ -286,43 +459,43 @@ std::string LlamaTranslator::translate(const Segment& segment) {
             }
 
             generated += token_to_piece(tok);
-            if (has_early_stop_marker(generated)) {
+            if (!segment.coalesced_batch && has_early_stop_marker(generated)) {
                 break;
             }
             dec_batch = llama_batch_get_one(&tok, 1);
         }
 
-        return postprocess_translation(std::move(generated));
+            return postprocess_translation(std::move(generated), segment.coalesced_batch);
+        }
+
+        decode_prompt_chunks(ctx_, prompt_i32_scratch_.data(), prompt_len, ctx_n_batch_);
+
+        std::string generated;
+
+        for (int i = 0; i < gen_cap; ++i) {
+            const llama_token tok = llama_sampler_sample(sampler_, ctx_, -1);
+            if (llama_vocab_is_eog(shared_model_->vocab, tok)) {
+                break;
+            }
+
+            generated += token_to_piece(tok);
+            if (!segment.coalesced_batch && has_early_stop_marker(generated)) {
+                break;
+            }
+
+            if (i + 1 >= gen_cap) {
+                break;
+            }
+
+            llama_token next = tok;
+            llama_batch batch = llama_batch_get_one(&next, 1);
+            if (llama_decode(ctx_, batch) != 0) {
+                throw std::runtime_error("llama_decode failed for continuation token");
+            }
+        }
+
+        return postprocess_translation(std::move(generated), segment.coalesced_batch);
     }
 
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
-    if (llama_decode(ctx_, batch) != 0) {
-        throw std::runtime_error("llama_decode failed for prompt");
-    }
-
-    std::string generated;
-
-    for (int i = 0; i < std::max(1, config_.max_tokens); ++i) {
-        const llama_token tok = llama_sampler_sample(sampler_, ctx_, -1);
-        if (llama_vocab_is_eog(shared_model_->vocab, tok)) {
-            break;
-        }
-
-        generated += token_to_piece(tok);
-        if (has_early_stop_marker(generated)) {
-            break;
-        }
-
-        if (i + 1 >= std::max(1, config_.max_tokens)) {
-            break;
-        }
-
-        llama_token next = tok;
-        batch = llama_batch_get_one(&next, 1);
-        if (llama_decode(ctx_, batch) != 0) {
-            throw std::runtime_error("llama_decode failed for continuation token");
-        }
-    }
-
-    return postprocess_translation(std::move(generated));
+    throw std::runtime_error("ctx-grow: exceeded maximum context growth attempts");
 }

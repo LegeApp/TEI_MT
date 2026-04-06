@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include "pipeline.hpp"
+#include "sorting_filter.hpp"
 #include "tei_reader.hpp"
 #include "translator_llama.hpp"
 #include "writer_md.hpp"
@@ -17,14 +18,82 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <pugixml.hpp>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
 constexpr const char* kDefaultModelUrl =
     "https://huggingface.co/tencent/HY-MT1.5-1.8B-GGUF/resolve/main/HY-MT1.5-1.8B-Q8_0.gguf?download=true";
+constexpr const char* kDefaultModelName = "HY-MT1.5-1.8B-Q8_0.gguf";
+constexpr const char* kDefaultSortingDataName = "buddhist_metadata_analysis.json";
+
+std::filesystem::path detect_runtime_dir(const char* argv0) {
+#ifdef _WIN32
+    char module_path[MAX_PATH];
+    const DWORD len = GetModuleFileNameA(nullptr, module_path, MAX_PATH);
+    if (len > 0) {
+        std::filesystem::path p(std::string(module_path, len));
+        const auto parent = p.parent_path();
+        if (!parent.empty()) {
+            return parent;
+        }
+    }
+#endif
+
+    if (argv0 == nullptr || *argv0 == '\0') {
+        return std::filesystem::current_path();
+    }
+
+    std::filesystem::path exe_path(argv0);
+    std::error_code ec;
+    if (exe_path.is_relative()) {
+        exe_path = std::filesystem::current_path(ec) / exe_path;
+    }
+    exe_path = std::filesystem::weakly_canonical(exe_path, ec);
+    if (!ec && !exe_path.empty()) {
+        const auto parent = exe_path.parent_path();
+        if (!parent.empty()) {
+            return parent;
+        }
+    }
+
+    return std::filesystem::current_path();
+}
+
+std::filesystem::path resolve_optional_path_with_runtime_dir(
+    const std::filesystem::path& maybe_relative,
+    const std::filesystem::path& runtime_dir
+) {
+    if (maybe_relative.empty()) {
+        return maybe_relative;
+    }
+    if (maybe_relative.is_absolute()) {
+        return maybe_relative;
+    }
+    return runtime_dir / maybe_relative;
+}
+
+std::filesystem::path derive_default_output_dir(const std::filesystem::path& input, bool input_is_dir) {
+    std::filesystem::path base = input_is_dir ? input : input.parent_path();
+    if (base.empty()) {
+        base = std::filesystem::current_path();
+    }
+
+    const auto base_name = base.filename().string();
+    const auto suffixed = (base_name.empty() ? std::string("translatedt") : base_name + "t");
+    return base.parent_path() / suffixed;
+}
 
 std::string shell_single_quote(const std::string& s) {
     std::string out;
@@ -47,6 +116,511 @@ bool has_xml_extension(const std::filesystem::path& path) {
         return static_cast<char>(std::tolower(c));
     });
     return ext == ".xml";
+}
+
+bool has_sorting_filters(const AppConfig& config) {
+    return !config.filter_canon.empty()
+        || !config.filter_tradition.empty()
+        || !config.filter_period.empty()
+        || !config.filter_origin.empty();
+}
+
+std::string join_values(const std::vector<std::string>& values) {
+    if (values.empty()) {
+        return "(any)";
+    }
+    std::ostringstream out;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << values[i];
+    }
+    return out.str();
+}
+
+std::string trim_copy(std::string s) {
+    const auto not_space = [](unsigned char c) {
+        return !std::isspace(c);
+    };
+    const auto first = std::find_if(s.begin(), s.end(), not_space);
+    if (first == s.end()) {
+        return {};
+    }
+    const auto last = std::find_if(s.rbegin(), s.rend(), not_space).base();
+    return std::string(first, last);
+}
+
+enum class DrilldownCategory {
+    Canon,
+    Tradition,
+    Period,
+    Origin,
+};
+
+std::string category_label(DrilldownCategory category) {
+    switch (category) {
+        case DrilldownCategory::Canon:
+            return "Canon";
+        case DrilldownCategory::Tradition:
+            return "Tradition";
+        case DrilldownCategory::Period:
+            return "Dynasty/Period";
+        case DrilldownCategory::Origin:
+            return "Geography/Origin";
+    }
+    return "Unknown";
+}
+
+std::string category_key(DrilldownCategory category) {
+    switch (category) {
+        case DrilldownCategory::Canon:
+            return "canon";
+        case DrilldownCategory::Tradition:
+            return "tradition";
+        case DrilldownCategory::Period:
+            return "period";
+        case DrilldownCategory::Origin:
+            return "origin";
+    }
+    return "unknown";
+}
+
+bool parse_category_token(const std::string& token, DrilldownCategory& out_category) {
+    std::string normalized = trim_copy(token);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (normalized == "canon") {
+        out_category = DrilldownCategory::Canon;
+        return true;
+    }
+    if (normalized == "tradition" || normalized == "traditions" || normalized == "sect") {
+        out_category = DrilldownCategory::Tradition;
+        return true;
+    }
+    if (normalized == "period" || normalized == "dynasty" || normalized == "timeperiod") {
+        out_category = DrilldownCategory::Period;
+        return true;
+    }
+    if (normalized == "origin" || normalized == "geography" || normalized == "geo") {
+        out_category = DrilldownCategory::Origin;
+        return true;
+    }
+
+    return false;
+}
+
+void add_filter_value(SortingFilters& filters, DrilldownCategory category, const std::string& value) {
+    switch (category) {
+        case DrilldownCategory::Canon:
+            filters.canon.push_back(value);
+            break;
+        case DrilldownCategory::Tradition:
+            filters.tradition.push_back(value);
+            break;
+        case DrilldownCategory::Period:
+            filters.period.push_back(value);
+            break;
+        case DrilldownCategory::Origin:
+            filters.origin.push_back(value);
+            break;
+    }
+}
+
+bool parse_drilldown_term(
+    const std::string& term,
+    DrilldownCategory& out_category,
+    std::string& out_value,
+    std::string& error
+) {
+    const auto eq = term.find('=');
+    const auto colon = term.find(':');
+    const auto sep = eq != std::string::npos ? eq : colon;
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= term.size()) {
+        error = "Invalid --drilldown term '" + term + "'. Expected category=value.";
+        return false;
+    }
+
+    const auto category_token = trim_copy(term.substr(0, sep));
+    out_value = trim_copy(term.substr(sep + 1));
+    if (out_value.empty()) {
+        error = "Invalid --drilldown term '" + term + "': missing value.";
+        return false;
+    }
+    if (!parse_category_token(category_token, out_category)) {
+        error = "Unknown drill-down category '" + category_token + "'.";
+        return false;
+    }
+    return true;
+}
+
+bool build_filters_from_drilldown_terms(
+    const std::vector<std::string>& terms,
+    SortingFilters& out_filters,
+    std::string& error
+) {
+    out_filters = {};
+    std::unordered_map<std::string, std::size_t> category_hits;
+    for (const auto& term : terms) {
+        DrilldownCategory category = DrilldownCategory::Canon;
+        std::string value;
+        if (!parse_drilldown_term(term, category, value, error)) {
+            return false;
+        }
+        add_filter_value(out_filters, category, value);
+        ++category_hits[category_key(category)];
+    }
+
+    if (category_hits.empty()) {
+        error = "No drill-down terms provided.";
+        return false;
+    }
+    if (category_hits.size() > 2) {
+        error = "--drilldown currently supports up to two categories.";
+        return false;
+    }
+    for (const auto& [category, count] : category_hits) {
+        if (count > 1) {
+            error = "Category '" + category + "' specified multiple times in --drilldown.";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::filesystem::path> apply_sorting_filters(
+    const std::vector<std::filesystem::path>& files,
+    const SortingMetadataIndex& metadata_index,
+    const std::filesystem::path& input_root,
+    bool input_is_dir,
+    const SortingFilters& filters
+) {
+    std::vector<std::filesystem::path> out;
+    out.reserve(files.size());
+    for (const auto& file : files) {
+        if (metadata_index.match(file, input_root, input_is_dir, filters)) {
+            out.push_back(file);
+        }
+    }
+    return out;
+}
+
+std::vector<std::pair<std::string, std::size_t>> count_by_category(
+    const std::vector<std::filesystem::path>& files,
+    const SortingMetadataIndex& metadata_index,
+    const std::filesystem::path& input_root,
+    bool input_is_dir,
+    DrilldownCategory category
+) {
+    std::unordered_map<std::string, std::size_t> counts;
+
+    for (const auto& file : files) {
+        const auto* rec = metadata_index.lookup(file, input_root, input_is_dir);
+        if (rec == nullptr) {
+            continue;
+        }
+
+        if (category == DrilldownCategory::Tradition) {
+            std::vector<std::string> values = rec->traditions;
+            if (values.empty()) {
+                values.push_back("Unknown Tradition");
+            }
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end()), values.end());
+            for (const auto& value : values) {
+                const auto label = value.empty() ? "Unknown Tradition" : value;
+                ++counts[label];
+            }
+            continue;
+        }
+
+        std::string value;
+        if (category == DrilldownCategory::Canon) {
+            value = rec->canon.empty() ? "Unknown" : rec->canon;
+        } else if (category == DrilldownCategory::Period) {
+            value = rec->period.empty() ? "Unknown Period" : rec->period;
+        } else if (category == DrilldownCategory::Origin) {
+            value = rec->origin.empty() ? "Unknown Origin" : rec->origin;
+        }
+        ++counts[value];
+    }
+
+    std::vector<std::pair<std::string, std::size_t>> out;
+    out.reserve(counts.size());
+    for (const auto& [key, count] : counts) {
+        out.push_back({key, count});
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) {
+            return a.second > b.second;
+        }
+        return a.first < b.first;
+    });
+    return out;
+}
+
+void print_options_with_counts(
+    const std::vector<std::pair<std::string, std::size_t>>& options
+) {
+    for (std::size_t i = 0; i < options.size(); ++i) {
+        std::cout
+            << "  " << (i + 1) << ". "
+            << options[i].first
+            << " (" << options[i].second << ")\n";
+    }
+}
+
+void print_drilldown_help_for_dataset(
+    const std::vector<std::filesystem::path>& files,
+    const SortingMetadataIndex& metadata_index,
+    const std::filesystem::path& input_root,
+    bool input_is_dir
+) {
+    const std::vector<DrilldownCategory> categories = {
+        DrilldownCategory::Tradition,
+        DrilldownCategory::Period,
+        DrilldownCategory::Origin,
+        DrilldownCategory::Canon,
+    };
+
+    std::cout << "Drill-down help\n";
+    std::cout << "Category keys:\n";
+    std::cout << "  canon\n";
+    std::cout << "  tradition (alias: traditions, sect)\n";
+    std::cout << "  period (alias: dynasty, timeperiod)\n";
+    std::cout << "  origin (alias: geography, geo)\n\n";
+    std::cout << "Syntax:\n";
+    std::cout << "  --drilldown category=value\n";
+    std::cout << "  --drilldown category:value\n";
+    std::cout << "  (repeat --drilldown up to two categories)\n\n";
+    std::cout << "Combination mode: AND across categories.\n";
+    std::cout << "Supported category pairs:\n";
+    for (std::size_t i = 0; i < categories.size(); ++i) {
+        for (std::size_t j = i + 1; j < categories.size(); ++j) {
+            std::cout << "  " << category_key(categories[i]) << " + " << category_key(categories[j]) << "\n";
+        }
+    }
+    std::cout << "\n";
+
+    std::size_t matched_records = 0;
+    for (const auto& file : files) {
+        if (metadata_index.lookup(file, input_root, input_is_dir) != nullptr) {
+            ++matched_records;
+        }
+    }
+    std::cout << "Dataset scope:\n";
+    std::cout << "  input XML files: " << files.size() << "\n";
+    std::cout << "  files with metadata records: " << matched_records << "\n\n";
+
+    for (const auto category : categories) {
+        std::cout << category_label(category) << " subcategories:\n";
+        const auto options = count_by_category(files, metadata_index, input_root, input_is_dir, category);
+        print_options_with_counts(options);
+        std::cout << "\n";
+    }
+
+    std::cout << "Examples:\n";
+    std::cout << "  --drilldown period=Tang --drilldown tradition=Chan/Zen\n";
+    std::cout << "  --drilldown origin=\"Unknown Origin\"\n";
+}
+
+bool prompt_yes_no(const std::string& prompt, bool default_yes, bool& answer, bool& cancelled) {
+    cancelled = false;
+    while (true) {
+        std::cout << prompt << (default_yes ? " [Y/n]: " : " [y/N]: ");
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            cancelled = true;
+            return false;
+        }
+        line = trim_copy(line);
+        std::transform(line.begin(), line.end(), line.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (line.empty()) {
+            answer = default_yes;
+            return true;
+        }
+        if (line == "y" || line == "yes") {
+            answer = true;
+            return true;
+        }
+        if (line == "n" || line == "no") {
+            answer = false;
+            return true;
+        }
+        if (line == "q" || line == "quit") {
+            cancelled = true;
+            return false;
+        }
+        std::cout << "Please answer y or n (or q to cancel).\n";
+    }
+}
+
+bool prompt_index_choice(
+    const std::string& prompt,
+    std::size_t max_value,
+    std::size_t& out_index,
+    bool& cancelled
+) {
+    cancelled = false;
+    while (true) {
+        std::cout << prompt;
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            cancelled = true;
+            return false;
+        }
+        line = trim_copy(line);
+        std::transform(line.begin(), line.end(), line.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (line == "q" || line == "quit") {
+            cancelled = true;
+            return false;
+        }
+        try {
+            const auto choice = static_cast<std::size_t>(std::stoull(line));
+            if (choice >= 1 && choice <= max_value) {
+                out_index = choice - 1;
+                return true;
+            }
+        } catch (...) {
+        }
+        std::cout << "Invalid selection. Enter a number between 1 and " << max_value << " (or q to cancel).\n";
+    }
+}
+
+bool interactive_drilldown_select(
+    const SortingMetadataIndex& metadata_index,
+    const std::filesystem::path& input_root,
+    bool input_is_dir,
+    const std::vector<std::filesystem::path>& all_files,
+    SortingFilters& out_filters,
+    std::vector<std::filesystem::path>& out_files,
+    bool& cancelled,
+    std::string& error
+) {
+    cancelled = false;
+    out_filters = {};
+    out_files = all_files;
+
+    const std::vector<DrilldownCategory> categories = {
+        DrilldownCategory::Tradition,
+        DrilldownCategory::Period,
+        DrilldownCategory::Origin,
+        DrilldownCategory::Canon,
+    };
+
+    std::cout << "[drilldown] interactive selector\n";
+    std::cout << "Choose primary category:\n";
+    for (std::size_t i = 0; i < categories.size(); ++i) {
+        std::cout << "  " << (i + 1) << ". " << category_label(categories[i]) << "\n";
+    }
+
+    std::size_t primary_category_index = 0;
+    if (!prompt_index_choice("Primary category number (or q to cancel): ", categories.size(), primary_category_index, cancelled)) {
+        return false;
+    }
+    const auto primary_category = categories[primary_category_index];
+
+    const auto primary_options = count_by_category(out_files, metadata_index, input_root, input_is_dir, primary_category);
+    if (primary_options.empty()) {
+        error = "No metadata buckets available for selected primary category.";
+        return false;
+    }
+
+    std::cout << "Primary subcategory options for " << category_label(primary_category) << ":\n";
+    print_options_with_counts(primary_options);
+    std::size_t primary_value_index = 0;
+    if (!prompt_index_choice("Primary subcategory number (or q to cancel): ", primary_options.size(), primary_value_index, cancelled)) {
+        return false;
+    }
+    const auto& primary_value = primary_options[primary_value_index].first;
+    const auto primary_count = primary_options[primary_value_index].second;
+    add_filter_value(out_filters, primary_category, primary_value);
+    out_files = apply_sorting_filters(all_files, metadata_index, input_root, input_is_dir, out_filters);
+
+    std::cout
+        << "[drilldown] selected "
+        << category_label(primary_category) << " = " << primary_value
+        << " -> " << primary_count << " files\n";
+
+    bool add_secondary = false;
+    if (!prompt_yes_no("Add secondary drill-down?", false, add_secondary, cancelled)) {
+        return false;
+    }
+    if (add_secondary) {
+        std::vector<DrilldownCategory> secondary_categories;
+        for (const auto category : categories) {
+            if (category != primary_category) {
+                secondary_categories.push_back(category);
+            }
+        }
+
+        std::cout << "Choose secondary category:\n";
+        for (std::size_t i = 0; i < secondary_categories.size(); ++i) {
+            std::cout << "  " << (i + 1) << ". " << category_label(secondary_categories[i]) << "\n";
+        }
+
+        std::size_t secondary_category_index = 0;
+        if (!prompt_index_choice("Secondary category number (or q to cancel): ", secondary_categories.size(), secondary_category_index, cancelled)) {
+            return false;
+        }
+        const auto secondary_category = secondary_categories[secondary_category_index];
+        const auto secondary_options = count_by_category(out_files, metadata_index, input_root, input_is_dir, secondary_category);
+        if (secondary_options.empty()) {
+            error = "No metadata buckets available for selected secondary category.";
+            return false;
+        }
+
+        std::cout
+            << "Secondary subcategory options for "
+            << category_label(secondary_category)
+            << " (within current selection):\n";
+        print_options_with_counts(secondary_options);
+
+        std::size_t secondary_value_index = 0;
+        if (!prompt_index_choice("Secondary subcategory number (or q to cancel): ", secondary_options.size(), secondary_value_index, cancelled)) {
+            return false;
+        }
+        const auto& secondary_value = secondary_options[secondary_value_index].first;
+        const auto secondary_count = secondary_options[secondary_value_index].second;
+
+        add_filter_value(out_filters, secondary_category, secondary_value);
+        out_files = apply_sorting_filters(all_files, metadata_index, input_root, input_is_dir, out_filters);
+
+        std::cout
+            << "[drilldown] selected "
+            << category_label(secondary_category) << " = " << secondary_value
+            << " -> " << secondary_count << " files in subcategory\n";
+    }
+
+    if (out_files.empty()) {
+        error = "Drill-down matched zero files.";
+        return false;
+    }
+
+    std::cout
+        << "[drilldown] final selection files=" << out_files.size()
+        << " canon=" << join_values(out_filters.canon)
+        << " tradition=" << join_values(out_filters.tradition)
+        << " period=" << join_values(out_filters.period)
+        << " origin=" << join_values(out_filters.origin)
+        << "\n";
+
+    bool start = false;
+    if (!prompt_yes_no("Start translation job for this queue now?", true, start, cancelled)) {
+        return false;
+    }
+    if (!start) {
+        cancelled = true;
+        return false;
+    }
+
+    return true;
 }
 
 bool collect_input_files(
@@ -323,13 +897,156 @@ int main(int argc, char** argv) {
         return error == "help" ? 0 : 1;
     }
 
+    {
+        const unsigned hc = std::thread::hardware_concurrency();
+        std::cout << "[config] workers=" << config.workers << " llama_threads=" << config.n_threads
+                  << " (workers*llama_threads=" << (config.workers * static_cast<std::size_t>(config.n_threads));
+        if (hc == 0) {
+            std::cout << ", hardware_concurrency=unknown)\n";
+        } else {
+            std::cout << ", hardware_concurrency=" << hc << ")\n";
+        }
+        std::cout << "[config] segment_coalesce=" << (config.coalesce_segments ? "on" : "off")
+                  << " coalesce_max_batch=" << config.coalesce_max_batch
+                  << " coalesce_max_chars=" << config.coalesce_max_merged_chars << "\n";
+        std::cout << "[config] ctx=" << config.n_ctx << " max_ctx=" << config.max_n_ctx << " (auto-grow on)\n";
+    }
+
+    const auto runtime_dir = detect_runtime_dir(argv[0]);
+    if (config.model_path.empty()) {
+        config.model_path = kDefaultModelName;
+    }
+    config.model_path = resolve_optional_path_with_runtime_dir(config.model_path, runtime_dir).string();
+
+    const bool needs_sorting_data =
+        has_sorting_filters(config) || config.interactive_drilldown || config.drilldown_help || !config.drilldown_select.empty();
+    if (needs_sorting_data) {
+        if (config.sorting_data_path.empty()) {
+            config.sorting_data_path = kDefaultSortingDataName;
+        }
+        config.sorting_data_path = resolve_optional_path_with_runtime_dir(config.sorting_data_path, runtime_dir);
+    }
+
+    if (!std::filesystem::exists(config.input_path)) {
+        std::cerr << "Input path does not exist: " << config.input_path << "\n";
+        return 1;
+    }
+    const bool input_is_dir = std::filesystem::is_directory(config.input_path);
+    if (config.output_dir.empty() && !config.drilldown_help) {
+        config.output_dir = derive_default_output_dir(config.input_path, input_is_dir);
+        std::cout << "[config] default output=" << config.output_dir << "\n";
+    }
+
+    const auto scan_output_anchor = config.output_dir.empty()
+        ? (std::filesystem::current_path() / "__tei_mt_no_output__")
+        : config.output_dir;
+
     std::vector<std::filesystem::path> input_files;
-    if (!collect_input_files(config.input_path, config.output_dir, input_files, error)) {
+    if (!collect_input_files(config.input_path, scan_output_anchor, input_files, error)) {
         std::cerr << error << "\n";
         return 1;
     }
 
-    const bool input_is_dir = std::filesystem::is_directory(config.input_path);
+    if (has_sorting_filters(config) || config.interactive_drilldown || config.drilldown_help || !config.drilldown_select.empty()) {
+        SortingMetadataIndex metadata_index;
+        if (!metadata_index.load(config.sorting_data_path, error)) {
+            std::cerr << "[fatal] " << error << "\n";
+            return 1;
+        }
+
+        if (config.drilldown_help) {
+            print_drilldown_help_for_dataset(
+                input_files,
+                metadata_index,
+                config.input_path,
+                input_is_dir
+            );
+            return 0;
+        } else if (config.interactive_drilldown) {
+            SortingFilters interactive_filters;
+            std::vector<std::filesystem::path> interactive_files;
+            bool cancelled = false;
+            if (!interactive_drilldown_select(
+                    metadata_index,
+                    config.input_path,
+                    input_is_dir,
+                    input_files,
+                    interactive_filters,
+                    interactive_files,
+                    cancelled,
+                    error
+                )) {
+                if (cancelled) {
+                    std::cout << "[drilldown] cancelled by user.\n";
+                    return 0;
+                }
+                std::cerr << "[fatal] " << error << "\n";
+                return 1;
+            }
+
+            input_files.swap(interactive_files);
+        } else if (!config.drilldown_select.empty()) {
+            SortingFilters drilldown_filters;
+            if (!build_filters_from_drilldown_terms(config.drilldown_select, drilldown_filters, error)) {
+                std::cerr << "[fatal] " << error << "\n";
+                return 1;
+            }
+
+            std::vector<std::filesystem::path> filtered_files = apply_sorting_filters(
+                input_files,
+                metadata_index,
+                config.input_path,
+                input_is_dir,
+                drilldown_filters
+            );
+
+            std::cout
+                << "[drilldown] canon=" << join_values(drilldown_filters.canon)
+                << " tradition=" << join_values(drilldown_filters.tradition)
+                << " period=" << join_values(drilldown_filters.period)
+                << " origin=" << join_values(drilldown_filters.origin)
+                << " matched=" << filtered_files.size() << "/" << input_files.size()
+                << "\n" << std::flush;
+
+            if (filtered_files.empty()) {
+                std::cerr << "[fatal] Drill-down matched zero XML files.\n";
+                return 1;
+            }
+
+            input_files.swap(filtered_files);
+        } else {
+            SortingFilters filters;
+            filters.canon = config.filter_canon;
+            filters.tradition = config.filter_tradition;
+            filters.period = config.filter_period;
+            filters.origin = config.filter_origin;
+
+            std::vector<std::filesystem::path> filtered_files = apply_sorting_filters(
+                input_files,
+                metadata_index,
+                config.input_path,
+                input_is_dir,
+                filters
+            );
+
+            std::cout
+                << "[filter] sorting-data=" << config.sorting_data_path
+                << " canon=" << join_values(config.filter_canon)
+                << " tradition=" << join_values(config.filter_tradition)
+                << " period=" << join_values(config.filter_period)
+                << " origin=" << join_values(config.filter_origin)
+                << " matched=" << filtered_files.size() << "/" << input_files.size()
+                << "\n" << std::flush;
+
+            if (filtered_files.empty()) {
+                std::cerr << "[fatal] Metadata filters matched zero XML files.\n";
+                return 1;
+            }
+
+            input_files.swap(filtered_files);
+        }
+    }
+
     const bool output_is_single_xml_file = !input_is_dir && output_path_looks_like_xml_file(config.output_dir);
     if (input_is_dir && output_is_single_xml_file) {
         std::cerr << "For directory input, --output must be a directory path.\n";
@@ -353,6 +1070,7 @@ int main(int argc, char** argv) {
     LlamaTranslatorConfig translator_cfg;
     translator_cfg.model_path = config.model_path;
     translator_cfg.n_ctx = config.n_ctx;
+    translator_cfg.max_n_ctx = config.max_n_ctx;
     translator_cfg.n_gpu_layers = config.n_gpu_layers;
     translator_cfg.n_threads = config.n_threads;
     translator_cfg.max_tokens = config.max_tokens;
@@ -435,15 +1153,34 @@ int main(int argc, char** argv) {
             );
         };
 
-        if (!translate_segments_parallel(
-                doc.segments,
-                *translator,
-                config.workers,
-                translations,
-                stats,
-                error,
-                progress_callback
-            )) {
+        const bool ok_translate = config.coalesce_segments
+            ? translate_segments_coalesced_parallel(
+                  doc.segments,
+                  *translator,
+                  config.workers,
+                  CoalesceParams{
+                      .enabled = true,
+                      .max_per_batch = static_cast<std::size_t>(config.coalesce_max_batch),
+                      .max_merged_chars = static_cast<std::size_t>(config.coalesce_max_merged_chars),
+                      .max_tokens_per_segment = config.max_tokens,
+                      .n_ctx = config.n_ctx,
+                  },
+                  translations,
+                  stats,
+                  error,
+                  progress_callback
+              )
+            : translate_segments_parallel(
+                  doc.segments,
+                  *translator,
+                  config.workers,
+                  translations,
+                  stats,
+                  error,
+                  progress_callback
+              );
+
+        if (!ok_translate) {
             std::cerr << "[error] translation failed for " << xml_file << ": " << error << "\n";
             ++files_failed;
             continue;
@@ -498,6 +1235,8 @@ int main(int argc, char** argv) {
         std::cout
             << "[ok] " << xml_file.filename().string()
             << " segments=" << stats.segments_total
+            << " units=" << stats.translation_units
+            << " coalesce_fallbacks=" << stats.coalesce_fallback_units
             << " workers=" << stats.workers_used
             << " time_ms=" << stats.wall_time.count()
             << " ms_per_segment=" << stats.ms_per_segment
